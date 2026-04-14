@@ -283,3 +283,39 @@ def get_stats():
         "by_month": by_month,
         "by_categoria": by_cat.to_dict(orient="records"),
     }
+
+
+@app.post("/ai/analisi", dependencies=[Depends(verify_token)])
+async def ai_analisi(request: dict):
+    """Call Claude API to analyze spending data."""
+    import httpx
+    
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not anthropic_key:
+        raise HTTPException(500, "ANTHROPIC_API_KEY not configured")
+    
+    prompt = request.get("prompt", "")
+    if not prompt:
+        raise HTTPException(400, "Missing prompt")
+    
+    async with httpx.AsyncClient(timeout=30) as client:
+        res = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": anthropic_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 600,
+                "messages": [{"role": "user", "content": prompt}]
+            }
+        )
+    
+    if res.status_code != 200:
+        raise HTTPException(500, f"Claude API error: {res.text}")
+    
+    data = res.json()
+    text = data.get("content", [{}])[0].get("text", "")
+    return {"text": text}
