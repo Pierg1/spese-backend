@@ -126,16 +126,18 @@ async def upload_excel(file: UploadFile = File(...)):
     skipped = 0
 
     for _, row in df.iterrows():
+        op_norm = normalize_op(row["operazione"])
         record = {
             "data": str(row["data"]),
             "operazione": row["operazione"],
+            "op_norm": op_norm,
             "dettagli": row["dettagli"],
             "categoria": row["categoria"],
             "importo": float(row["importo"]),
         }
         res = sb.table("movimenti").upsert(
             record,
-            on_conflict="data,dettagli,importo"
+            on_conflict="data,op_norm,importo"
         ).execute()
         if res.data:
             inserted += 1
@@ -215,9 +217,10 @@ async def upload_paypal(file: UploadFile = File(...)):
             "importo": importo,
         }
 
+        record["op_norm"] = normalize_op(row["operazione"])
         res = sb.table("movimenti").upsert(
             record,
-            on_conflict="data,dettagli,importo"
+            on_conflict="data,op_norm,importo"
         ).execute()
         if res.data:
             inserted += 1
