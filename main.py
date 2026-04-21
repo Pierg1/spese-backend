@@ -36,11 +36,16 @@ def verify_token(x_api_key: str = Header(...)):
 def normalize_op(op: str) -> str:
     """Normalize operation string for dedup comparison."""
     op = op.lower().strip()
-    op = re.sub(r'\b(effettuato il|mediante la cart\w*|alle ore|san francisco|ireland|limited|s\.?r\.?l\.?|s\.?p\.?a\.?)\b', '', op)
-    op = re.sub(r'\d{6,}', '#', op)
-    op = re.sub(r'\s+', ' ', op).strip()
+    # Remove noise words
+    op = re.sub(r'\b(effettuato il|mediante la cart\w*|alle ore|san francisco|ireland|limited)\b', '', op)
+    # Remove s.r.l., s.p.a. with dots
+    op = re.sub(r's\.?\s*r\.?\s*l\.?', '', op)
+    op = re.sub(r's\.?\s*p\.?\s*a\.?', '', op)
+    # Remove long numbers
+    op = re.sub(r'\d{4,}', '#', op)
+    # Collapse dots and spaces
+    op = re.sub(r'[\s.]+', ' ', op).strip()
     return op[:80]
-
 
 def parse_isybank_excel(file_bytes: bytes) -> pd.DataFrame:
     df = pd.read_excel(
@@ -160,8 +165,8 @@ async def upload_excel(file: UploadFile = File(...)):
 async def upload_paypal(file: UploadFile = File(...)):
     """
     Upload PayPal CSV.
-    For each PayPal transaction, try to enrich category by matching
-    existing Isybank 'PayPal' movements by date+amount.
+    Instead of inserting new rows, UPDATES existing Isybank movements
+    that have 'PayPal' in the description, matching by date±1 and amount.
     """
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(400, "File must be .csv")
@@ -174,71 +179,58 @@ async def upload_paypal(file: UploadFile = File(...)):
 
     sb = get_supabase()
 
-    # Load existing Isybank PayPal movements for enrichment matching
-    existing_res = sb.table("movimenti").select("data,importo,categoria,operazione").ilike("operazione", "%paypal%").execute()
+    # Load existing Isybank PayPal movements
+    existing_res = sb.table("movimenti").select("id,data,importo,operazione,categoria").ilike("operazione", "%paypal%").execute()
     existing_paypal = existing_res.data or []
 
-    # Build lookup: (date_str, amount) -> categoria
+    # Build lookup: (date_str, abs_amount) -> record
     paypal_lookup = {}
     for m in existing_paypal:
-        key = (m["data"], round(float(m["importo"]), 2))
-        if m.get("categoria") and m["categoria"] not in ("", "Altre uscite", "Domiciliazioni e Utenze"):
-            paypal_lookup[key] = m["categoria"]
+        key = (m["data"], abs(round(float(m["importo"]), 2)))
+        paypal_lookup[key] = m
 
-    inserted = 0
-    skipped = 0
-    enriched = 0
+    updated = 0
+    not_found = 0
 
     for _, row in df.iterrows():
-        data_str = str(row["data"])
-        importo = round(float(row["importo"]), 2)
-
-        # Try to match with existing Isybank PayPal movement
-        # Check same day and ±1 day window
-        categoria = None
+        importo_abs = abs(round(float(row["importo"]), 2))
+        
+        # Try date ±1 day
+        matched = None
         for delta in [0, -1, 1]:
-            from datetime import date
+            from datetime import date as date_cls, timedelta
             check_date = (row["data"] + timedelta(days=delta)).isoformat()
-            match_key = (check_date, importo)
-            if match_key in paypal_lookup:
-                categoria = paypal_lookup[match_key]
-                enriched += 1
+            key = (check_date, importo_abs)
+            if key in paypal_lookup:
+                matched = paypal_lookup[key]
                 break
 
-        if not categoria:
+        if matched:
+            # Infer category from PayPal merchant name
             categoria = infer_category_from_paypal(row["operazione"], row["oggetto"])
-
-        dettagli = f"PayPal - {row['codice']}"
-        record = {
-            "data": data_str,
-            "operazione": row["operazione"],
-            "dettagli": dettagli,
-            "categoria": categoria,
-            "importo": importo,
-        }
-
-        record["op_norm"] = normalize_op(row["operazione"])
-        res = sb.table("movimenti").upsert(
-            record,
-            on_conflict="data,op_norm,importo"
-        ).execute()
-        if res.data:
-            inserted += 1
+            # Only update if current category is generic
+            generic_cats = ["", "Altre uscite", "Domiciliazioni e Utenze", "Addebiti vari"]
+            if matched["categoria"] in generic_cats:
+                sb.table("movimenti").update({
+                    "operazione": row["operazione"][:100],
+                    "categoria": categoria,
+                }).eq("id", matched["id"]).execute()
+                updated += 1
+            else:
+                updated += 1  # already has good category, still count as matched
         else:
-            skipped += 1
+            not_found += 1
 
     return {
         "ok": True,
         "parsed": len(df),
-        "inserted": inserted,
-        "skipped": skipped,
-        "enriched": enriched,
+        "updated": updated,
+        "not_found": not_found,
         "date_range": {
             "from": str(df["data"].min()),
             "to": str(df["data"].max()),
         }
     }
-
 
 @app.get("/movimenti", dependencies=[Depends(verify_token)])
 def get_movimenti(from_date: str = None, to_date: str = None):
