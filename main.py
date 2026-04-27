@@ -33,19 +33,75 @@ def verify_token(x_api_key: str = Header(...)):
     return x_api_key
 
 
+ITALIAN_CITIES = {
+    "vigonza", "padova", "padov", "cadoneghe", "noventa", "massanzago",
+    "treviso", "trevisa", "venezia", "milano", "torino", "napoli",
+    "bologna", "verona", "vicenza", "rovigo", "mestre", "firenze",
+    "genova", "trieste", "bari", "palermo", "catania",
+    "roma", "rome", "cork", "luxembourg", "ireland", "francisco",
+    "san", "limited", "italy", "italia",
+}
+
+CORP_SUFFIXES = {
+    "srl", "srls", "spa", "snc", "sas", "ltd", "inc", "gmbh",
+    "scarl", "sca", "scs", "ag", "bv", "nv", "plc", "llc", "co",
+    "et", "cie", "the",
+}
+
+
 def normalize_op(op: str) -> str:
-    """Normalize operation string for dedup comparison."""
-    op = op.lower().strip()
-    # Remove noise words
-    op = re.sub(r'\b(effettuato il|mediante la cart\w*|alle ore|san francisco|ireland|limited)\b', '', op)
-    # Remove s.r.l., s.p.a. with dots
-    op = re.sub(r's\.?\s*r\.?\s*l\.?', '', op)
-    op = re.sub(r's\.?\s*p\.?\s*a\.?', '', op)
-    # Remove long numbers
-    op = re.sub(r'\d{4,}', '#', op)
-    # Collapse dots and spaces
-    op = re.sub(r'[\s.]+', ' ', op).strip()
-    return op[:80]
+    """Normalize operation string for dedup comparison.
+
+    Strategy:
+    - For SDD/PayPal/wire payments, the MANDATO id is the strongest fingerprint
+      and is used alone. All variants ("PayPal Europe S.a.r.l." vs
+      "PayPal (Europe) S.a r.l.") collapse to the same key.
+    - For card payments at merchants, strip city names, corporate suffixes,
+      transaction codes and markdown link artifacts, then keep the meaningful
+      tokens. Truncated to 40 chars.
+    """
+    if not op:
+        return ""
+    s = op.lower().strip()
+
+    # Markdown link artifact: "[text](url)" -> "text"
+    s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+
+    # Direct debit / SDD: keep the mandate id only — it uniquely identifies the
+    # creditor, regardless of how the bank formatted the description.
+    m = re.search(r"mandato\s+([a-z0-9]+)", s)
+    if m:
+        return f"mandato {m.group(1)}"
+
+    # Strip verbose Italian banking prefixes
+    s = re.sub(r"^(addebito|accredito)\s+diretto(\s+(disposto|ricevuto))?(\s+a\s+favore\s+di)?\s+", "", s)
+    s = re.sub(r"^bonifico(\s+(disposto|ricevuto))?(\s+a\s+favore\s+di)?\s+", "", s)
+    s = re.sub(r"^pagamento\s+", "", s)
+    s = re.sub(r"\beffettuato il\b.*", "", s)
+    s = re.sub(r"\bmediante la cart\w*\b.*", "", s)
+    s = re.sub(r"\balle ore\b.*", "", s)
+
+    # Collapse dotted acronyms ("s.r.l." -> "srl", "s.n.c." -> "snc")
+    s = re.sub(r"\b([a-z])\.([a-z])\.([a-z])\.?\b", r"\1\2\3", s)
+    s = re.sub(r"\b([a-z])\.([a-z])\.?\b", r"\1\2", s)
+
+    # Replace punctuation with spaces
+    s = re.sub(r"[().,*\-_/:;]", " ", s)
+    s = s.replace(".", " ")
+
+    # Drop transaction codes: any token containing a digit
+    s = re.sub(r"\b\w*\d\w*\b", "", s)
+
+    # Tokenize and filter
+    keep = []
+    for t in s.split():
+        if len(t) <= 1:
+            continue
+        if t in ITALIAN_CITIES or t in CORP_SUFFIXES:
+            continue
+        keep.append(t)
+
+    return " ".join(keep)[:40]
 
 def parse_isybank_excel(file_bytes: bytes) -> pd.DataFrame:
     df = pd.read_excel(
@@ -127,27 +183,47 @@ async def upload_excel(file: UploadFile = File(...)):
         raise HTTPException(400, f"Parse error: {e}")
 
     sb = get_supabase()
+
+    date_min = str(df["data"].min())
+    date_max = str(df["data"].max())
+    existing_res = (
+        sb.table("movimenti")
+        .select("data,op_norm,importo")
+        .gte("data", date_min)
+        .lte("data", date_max)
+        .execute()
+    )
+    existing_keys = {
+        (r["data"], r["op_norm"], round(float(r["importo"]), 2))
+        for r in (existing_res.data or [])
+    }
+
     inserted = 0
     skipped = 0
-
+    new_records = []
     for _, row in df.iterrows():
         op_norm = normalize_op(row["operazione"])
-        record = {
+        key = (str(row["data"]), op_norm, round(float(row["importo"]), 2))
+        if key in existing_keys:
+            skipped += 1
+            continue
+        existing_keys.add(key)
+        new_records.append({
             "data": str(row["data"]),
             "operazione": row["operazione"],
             "op_norm": op_norm,
             "dettagli": row["dettagli"],
             "categoria": row["categoria"],
             "importo": float(row["importo"]),
-        }
-        res = sb.table("movimenti").upsert(
-            record,
-            on_conflict="data,op_norm,importo"
+        })
+        inserted += 1
+
+    if new_records:
+        sb.table("movimenti").upsert(
+            new_records,
+            on_conflict="data,op_norm,importo",
+            ignore_duplicates=True,
         ).execute()
-        if res.data:
-            inserted += 1
-        else:
-            skipped += 1
 
     return {
         "ok": True,
@@ -231,6 +307,46 @@ async def upload_paypal(file: UploadFile = File(...)):
             "to": str(df["data"].max()),
         }
     }
+
+@app.post("/admin/recalc-norm", dependencies=[Depends(verify_token)])
+def recalc_norm():
+    """Recompute op_norm for every row using the current normalize_op().
+    Run once after changing the normalization logic. Returns a summary and
+    a list of (data, importo) groups that became duplicates so they can be
+    cleaned up manually."""
+    sb = get_supabase()
+    rows = sb.table("movimenti").select("id,data,importo,operazione,op_norm").execute().data or []
+
+    updates = 0
+    new_keys = {}
+    collisions = []
+
+    for r in rows:
+        new_norm = normalize_op(r["operazione"] or "")
+        key = (r["data"], new_norm, round(float(r["importo"]), 2))
+        if key in new_keys:
+            collisions.append({
+                "kept_id": new_keys[key],
+                "duplicate_id": r["id"],
+                "data": r["data"],
+                "importo": float(r["importo"]),
+                "operazione": r["operazione"],
+                "op_norm": new_norm,
+            })
+            continue
+        new_keys[key] = r["id"]
+        if new_norm != (r.get("op_norm") or ""):
+            sb.table("movimenti").update({"op_norm": new_norm}).eq("id", r["id"]).execute()
+            updates += 1
+
+    return {
+        "ok": True,
+        "scanned": len(rows),
+        "updated": updates,
+        "new_collisions": len(collisions),
+        "collisions": collisions[:200],
+    }
+
 
 @app.get("/movimenti", dependencies=[Depends(verify_token)])
 def get_movimenti(from_date: str = None, to_date: str = None):
