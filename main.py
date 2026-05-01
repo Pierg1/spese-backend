@@ -11,6 +11,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ============================================================
+# CONFIG
+# ============================================================
+# Data di inizio considerata valida. Tutto ciò che è precedente viene
+# scartato sia in import banca che in import PayPal. Modificare qui se
+# si vuole estendere o restringere il periodo coperto.
+from datetime import date as _date
+CUTOFF_DATE = _date(2025, 4, 1)
+
 app = FastAPI(title="Spese API", version="2.0.0")
 
 app.add_middleware(
@@ -124,6 +133,10 @@ def parse_isybank_excel(file_bytes: bytes) -> pd.DataFrame:
     df["operazione"] = df["operazione"].fillna("").astype(str)
     df["categoria"] = df["categoria"].fillna("").astype(str)
 
+    # Filtra OUT i movimenti precedenti al CUTOFF_DATE
+    pre_cutoff = int((df["data"] < CUTOFF_DATE).sum())
+    df = df[df["data"] >= CUTOFF_DATE].copy()
+
     # Filtra OUT i movimenti PayPal: li gestisce il file PayPal diretto
     mask_paypal = df.apply(
         lambda r: is_paypal_movement(r["operazione"], r["dettagli"]),
@@ -139,6 +152,7 @@ def parse_isybank_excel(file_bytes: bytes) -> pd.DataFrame:
 
     # Attacco metadati come attributi
     df.attrs["paypal_skipped"] = df_paypal_skipped
+    df.attrs["pre_cutoff_skipped"] = pre_cutoff
     return df
 
 
@@ -203,6 +217,10 @@ def parse_paypal_csv(file_bytes: bytes) -> pd.DataFrame:
         .astype(float)
     )
 
+    # Filtra OUT i movimenti precedenti al CUTOFF_DATE
+    pre_cutoff = int((df["data"] < CUTOFF_DATE).sum())
+    df = df[df["data"] >= CUTOFF_DATE].copy()
+
     def resolve_nome(row):
         """Risolve il nome merchant, seguendo il riferimento se necessario."""
         nome = row["Nome"]
@@ -224,6 +242,7 @@ def parse_paypal_csv(file_bytes: bytes) -> pd.DataFrame:
     df = df[["data", "operazione", "dettagli", "importo", "codice_paypal", "oggetto"]]
     df = df[df["codice_paypal"] != ""]
     df = df.drop_duplicates(subset=["codice_paypal"])
+    df.attrs["pre_cutoff_skipped"] = pre_cutoff
     return df
 
 
@@ -268,6 +287,7 @@ async def upload_excel(file: UploadFile = File(...)):
         raise HTTPException(400, f"Parse error: {e}")
 
     paypal_skipped = df.attrs.get("paypal_skipped", 0)
+    pre_cutoff_skipped = df.attrs.get("pre_cutoff_skipped", 0)
 
     if df.empty:
         return {
@@ -276,6 +296,7 @@ async def upload_excel(file: UploadFile = File(...)):
             "inserted": 0,
             "skipped": 0,
             "paypal_skipped": paypal_skipped,
+            "pre_cutoff_skipped": pre_cutoff_skipped,
             "date_range": None,
         }
 
@@ -337,10 +358,11 @@ async def upload_excel(file: UploadFile = File(...)):
 
     return {
         "ok": True,
-        "parsed": len(df) + paypal_skipped,
+        "parsed": len(df) + paypal_skipped + pre_cutoff_skipped,
         "inserted": inserted,
         "skipped": skipped,
         "paypal_skipped": paypal_skipped,
+        "pre_cutoff_skipped": pre_cutoff_skipped,
         "date_range": {
             "from": date_min,
             "to": date_max,
@@ -361,12 +383,15 @@ async def upload_paypal(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(400, f"Parse error: {e}")
 
+    pre_cutoff_skipped = df.attrs.get("pre_cutoff_skipped", 0)
+
     if df.empty:
         return {
             "ok": True,
             "parsed": 0,
             "inserted": 0,
             "skipped": 0,
+            "pre_cutoff_skipped": pre_cutoff_skipped,
             "date_range": None,
         }
 
@@ -418,9 +443,10 @@ async def upload_paypal(file: UploadFile = File(...)):
 
     return {
         "ok": True,
-        "parsed": len(df),
+        "parsed": len(df) + pre_cutoff_skipped,
         "inserted": inserted,
         "skipped": skipped,
+        "pre_cutoff_skipped": pre_cutoff_skipped,
         "date_range": {
             "from": str(df["data"].min()),
             "to": str(df["data"].max()),
